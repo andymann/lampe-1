@@ -3,7 +3,6 @@
 #include <Dmx_ESP32.h>
 
 #define NUM_DMX_CHANNELS 512   // note: library itself already #defines DMX_CHANNELS as 513 (start code + 512 slots)
-#define DEBUG 1
 
 // --- DMX output config ---
 // ESP32-C3 has only ONE hardware UART. We use it (Serial0 / UART0) exclusively
@@ -20,27 +19,35 @@ const int dmxEnablePin   = 4;   // DE/RE tied together on most RS485 modules —
 dmxTx dmxOut(&Serial0, dmxTransmitPin, dmxEnablePin);
 
 // received data is written from the ESP-NOW/WiFi task, read from loop() ->
-// guard the shared buffer with a small critical section.
-// (Still needed even though the C3 is single-core: the callback and loop()
-// run in different FreeRTOS tasks, so this protects against task-switch races,
-// not just multicore races.)
+// guard the shared buffer with a small critical section. The critical
+// section only ever protects the raw memcpy -- never a call into
+// dmxOut.writeBytes()/transmit(), since those have an internal duration
+// outside our control and holding interrupts disabled that whole time
+// risks dropping incoming ESP-NOW packets.
 uint8_t dmxData[NUM_DMX_CHANNELS];
 portMUX_TYPE dmxMux = portMUX_INITIALIZER_UNLOCKED;
-volatile bool newDmxData = false;
 
 ESPNowDMX_Receiver receiver;
 
 void dmxCallback(uint8_t universe, const uint8_t* data) {
-#ifdef DEBUG
-  Serial.printf("Received DMX universe %d - first 8 values: %d %d %d %d %d %d %d %d\n",
-                universe, data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
-#endif
+  const uint8_t expected = 149;   // whatever QLC+ channel 2 is set to
+  static int consecutiveBad = 0;
+
+  uint8_t v = data[1];
+
+  if (v != expected) {
+    consecutiveBad++;
+  } else {
+    if (consecutiveBad > 0) {
+      Serial.printf("[%lu] recovered after %d bad callback(s)\n", millis(), consecutiveBad);
+    }
+    consecutiveBad = 0;
+  }
+
   portENTER_CRITICAL(&dmxMux);
   memcpy(dmxData, data, NUM_DMX_CHANNELS);
-  newDmxData = true;
   portEXIT_CRITICAL(&dmxMux);
 }
-
 void onEspNowReceive(const uint8_t *mac, const uint8_t *data, int len) {
   receiver.handleReceive(mac, data, len);
 }
@@ -57,13 +64,15 @@ void setup() {
 }
 
 void loop() {
-  // Copy latest received frame into the DMX TX buffer and send it out.
-  // Re-sending the last known frame even without new data keeps fixtures
-  // from timing out if ESP-NOW packets are lost.
+  // Take a quick local snapshot under the lock, then release the lock
+  // BEFORE calling into dmxOut.writeBytes()/transmit().
+  static uint8_t localData[NUM_DMX_CHANNELS];
+
   portENTER_CRITICAL(&dmxMux);
-  dmxOut.writeBytes(dmxData, NUM_DMX_CHANNELS, 1); // channel numbering starts at 1
-  newDmxData = false;
+  memcpy(localData, dmxData, NUM_DMX_CHANNELS);
   portEXIT_CRITICAL(&dmxMux);
+
+  dmxOut.writeBytes(localData, NUM_DMX_CHANNELS, 1); // channel numbering starts at 1
 
   if (dmxOut.readyToTransmit()) {
     dmxOut.transmit();
