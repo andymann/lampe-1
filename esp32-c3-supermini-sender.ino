@@ -37,7 +37,7 @@
 
 #define DMX_RX_PIN   20   // FTDI TTL DMX line -> GPIO20 (matches this
                            // project's original C3 wiring)
-#define NUM_CHANNELS 6
+#define NUM_CHANNELS 512
 #define DMX_TASK_PRIORITY 5   // see rationale in the header comment above
 
 // Uncomment to enable the periodic serial debug dump (frame count +
