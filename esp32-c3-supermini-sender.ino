@@ -1,106 +1,154 @@
 /*
-    This sketch receives raw dmx data from QLC+ via FTDI Usb-serial adapter
-    and forwards it via espnow. The FTDI adapter is necessary to have an unpatched version
-    of QLC+ recognize the device as a DMX interface.
-*/
+ * DMX receiver -> forwards channels 1-6 out via ESP-NOW using the
+ * ESPNowDMX_Sender library.
+ *
+ * Target board: ESP32-C3 Super Mini (single-core RISC-V). Unlike the
+ * ESP32-WROOM-32 version of this sketch, there's only one CPU core
+ * here, so DMX reading and ESP-NOW sending can't run on separate
+ * cores -- but DMX reading still runs in its own dedicated FreeRTOS
+ * task rather than being polled inline from loop(), and that task's
+ * priority is kept moderate (5): high enough to service the DMX
+ * stream promptly, but not so high it starves loop()'s sender.loop()
+ * call (the actual ESP-NOW radio transmission) of CPU time -- a
+ * higher priority was tried earlier in this project and starved
+ * transmission almost entirely on this chip.
+ *
+ * DMX source: QLC+ output via the Enttec-Open-DMX-style libftdi path.
+ * Confirmed from QLC+'s own source (plugins/dmxusb/src/
+ * enttecdmxusbopen.cpp, qlcftdi-libftdi.cpp):
+ *   - 250000 baud, 8 data bits, 2 stop bits, no parity
+ *   - A REAL hardware break (110us) via the FTDI chip's own break-
+ *     control bit (ftdi_set_line_property2(..., BREAK_ON/OFF)) -- not
+ *     a software baud-switch simulation.
+ *   - 16us mark-after-break, ~30Hz default refresh rate.
+ *
+ * This is read directly as a local TTL serial link (FTDI TX -> ESP32
+ * RX) -- DMX512's RS-485 differential signaling only matters on an
+ * actual multi-drop cable run, not this point-to-point USB-serial tap,
+ * so no RS-485 conversion is needed or relevant here.
+ *
+ * DMX reception uses the Dmx_ESP32 library's dmxRx class (RMT-based
+ * break detection) at its default settings. Only channels 1-6 are read
+ * and forwarded.
+ */
 
-// Single-board DMX -> ESP-NOW bridge, for ESP32-C3 Super Mini.
-//
-// DMX input wiring: external USB-to-serial adapter TX -> GPIO20, GND -> board GND, 3.3V logic.
-//
-// DMX reception via Dmx_ESP32 (RMT-based break detection).
-//
-// - Only scan/forward as many channels as you actually use (DMX_CHANNELS
-//   below) -- scanning the full 512-channel universe every frame caused
-//   intermittent dark dropouts on this single-core chip.
-// - Reception occasionally glitches to a spurious 0 for a couple of
-//   frames (confirmed via packet-level logging on the receiver: the
-//   sender itself transmits a correct 2-byte delta packet claiming a
-//   channel dropped to 0, before self-correcting a few packets later --
-//   i.e. this is a real reception artifact in Dmx_ESP32 on this chip, not
-//   a transmission or receiver-decode issue). A zero-confirmation filter
-//   requires a drop to 0 to persist for 3 consecutive frames before it's
-//   trusted, while passing every other value (including active fades)
-//   through immediately with no added latency.
-// - ESPNowDMX_Sender is patched to send unicast to the receiver's specific
-//   MAC instead of broadcast, so lost frames get real hardware ack/retry.
-// - ESPNOW_DMX_ENABLE_COMPRESSION is disabled in ESPNowDMX_Common.h --
-//   the heatshrink decompression path could write partial/corrupt data
-//   into the receiver's live buffer before reporting failure.
 #include <Dmx_ESP32.h>
-#include <WiFi.h>
-#include "ESPNowDMX.h"
+#include "ESPNowDMX_Sender.h"
 
-#define DMX_CHANNELS 64   // <-- set to the number of channels you actually use
+#define DMX_RX_PIN   20   // FTDI TTL DMX line -> GPIO20 (matches this
+                           // project's original C3 wiring)
+#define NUM_CHANNELS 6
+#define DMX_TASK_PRIORITY 5   // see rationale in the header comment above
 
-#define RX_PIN     20
-#define RX_RMT     20
-#define RX_DISABLE -1
-#define LED_PIN    3
+// Uncomment to enable the periodic serial debug dump (frame count +
+// current channel values) in dmxTask.
+//#define DMX_DEBUG
 
-#define DMX_PORT_R &Serial1
+dmxRx dmx(&Serial1, DMX_RX_PIN);
+ESPNowDMX_Sender sender;
 
-dmxRx dmxReceive = dmxRx(DMX_PORT_R, RX_PIN, RX_RMT, RX_DISABLE, LED_PIN, LOW);
-ESPNowDMX dmx;
+// Whole-frame sanity filter: on the same library, on a different board
+// (ESP32-WROOM-32) in this project, the flicker turned out to be the
+// ENTIRE read (all 6 tracked channels at once) flipping between real
+// values and all-zero for sustained stretches (dozens of frames,
+// 0.5-1.5+ seconds), while QLC+'s own output monitor stayed rock-
+// steady throughout -- pointing at the dmxRx library's own buffer/state
+// occasionally self-clearing, not source corruption. A per-channel
+// filter is the wrong tool for that failure mode. Instead: if every
+// tracked channel reads 0 in the SAME update, treat that as suspect
+// and hold the last known good values, UNLESS it persists far longer
+// than the observed glitch ever did (ALL_ZERO_HOLD_FRAMES), in which
+// case it's accepted as a real blackout.
+uint8_t lastSent[NUM_CHANNELS + 1] = {0};
+unsigned long allZeroStreak = 0;
+#define ALL_ZERO_HOLD_FRAMES 90   // ~3s at ~30Hz -- well beyond any
+                                  // observed glitch duration
 
-static uint8_t lastSent[DMX_CHANNELS];
-static uint8_t lastGood[DMX_CHANNELS];
-static uint8_t zeroStreak[DMX_CHANNELS];
-static const uint8_t ZERO_CONFIRM_FRAMES = 3;   // requires 3 consecutive 0-readings before trusting a drop to 0
+void dmxTask(void *pvParameters) {
+  dmx.configure();
+  dmx.start();
+
+#ifdef DMX_DEBUG
+  unsigned long lastPrint = 0;
+  unsigned long frameCount = 0;
+#endif
+
+  for (;;) {
+    if (dmx.hasUpdated()) {
+#ifdef DMX_DEBUG
+      frameCount++;
+#endif
+
+      uint8_t raw[NUM_CHANNELS + 1];
+      bool allZero = true;
+      for (int ch = 1; ch <= NUM_CHANNELS; ch++) {
+        raw[ch] = dmx.read(ch);
+        if (raw[ch] != 0) allZero = false;
+      }
+
+      if (allZero) {
+        allZeroStreak++;
+        if (allZeroStreak > ALL_ZERO_HOLD_FRAMES) {
+          // Persisted far longer than the observed glitch ever did --
+          // accept it as a genuine blackout.
+          for (int ch = 1; ch <= NUM_CHANNELS; ch++) {
+            lastSent[ch] = 0;
+            sender.setChannel(ch, 0);
+          }
+        }
+        // else: suspected buffer-clear glitch -- hold last known good
+        // values, don't touch sender at all this cycle.
+      } else {
+        allZeroStreak = 0;
+        for (int ch = 1; ch <= NUM_CHANNELS; ch++) {
+          if (raw[ch] != lastSent[ch]) {
+            lastSent[ch] = raw[ch];
+            sender.setChannel(ch, raw[ch]);
+          }
+        }
+      }
+    }
+
+#ifdef DMX_DEBUG
+    unsigned long now = millis();
+    if (now - lastPrint >= 500) {
+      lastPrint = now;
+      Serial.print(now);
+      Serial.print("ms frames="); Serial.print(frameCount);
+      Serial.print(" ch1="); Serial.print(lastSent[1]);
+      Serial.print(" ch2="); Serial.print(lastSent[2]);
+      Serial.print(" ch3="); Serial.print(lastSent[3]);
+      Serial.print(" ch4="); Serial.print(lastSent[4]);
+      Serial.print(" ch5="); Serial.print(lastSent[5]);
+      Serial.print(" ch6="); Serial.println(lastSent[6]);
+    }
+#endif
+
+    vTaskDelay(1);
+  }
+}
 
 void setup() {
-  Serial.begin(115200);
-  delay(1500);   // let native USB CDC finish enumerating before first print
-  Serial.println("ready...");
+  Serial.begin(115200);   // USB serial, separate from Serial1/DMX
+#ifdef DMX_DEBUG
+  Serial.println("DMX->ESPNOW bridge starting...");
+#endif
 
-  if (!dmxReceive.configure()) {
-    Serial.println("DMX Receive Configure failed.");
-  } else {
-    Serial.println("DMX Receive Configured.");
-  }
+  sender.begin();
 
-  delay(10);
+  uint8_t universe[512] = {0};
+  sender.setUniverse(universe);
 
-  if (dmxReceive.start()) {
-    Serial.println("DMX reception started");
-  } else {
-    Serial.println("DMX reception aborted");
-  }
+  // No PinnedToCore variant needed -- the C3 only has one core, so a
+  // plain dedicated task at a moderate priority is the right shape
+  // here (see header comment).
+  xTaskCreate(dmxTask, "dmxTask", 4096, NULL, DMX_TASK_PRIORITY, NULL);
 
-  dmx.setUniverseId(0);
-  dmx.begin(ESPNOW_DMX_MODE_SENDER);
-  dmx.setFullRefreshInterval(60);   // was 200ms default
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+#ifdef DMX_DEBUG
+  Serial.println("dmxTask created, running.");
+#endif
 }
 
 void loop() {
-  if (dmxReceive.hasUpdated()) {
-    for (int i = 1; i <= DMX_CHANNELS; i++) {
-      uint8_t raw = dmxReceive.read(i);
-      int idx = i - 1;
-      uint8_t out;
-
-      if (raw == 0 && lastGood[idx] != 0) {
-        // suspicious: a sudden drop to 0 -- don't trust it yet
-        zeroStreak[idx]++;
-        if (zeroStreak[idx] >= ZERO_CONFIRM_FRAMES) {
-          out = 0;              // confirmed real -- accept it
-          lastGood[idx] = 0;
-        } else {
-          out = lastGood[idx];  // still unconfirmed -- hold the last known-good value
-        }
-      } else {
-        zeroStreak[idx] = 0;
-        out = raw;
-        lastGood[idx] = raw;
-      }
-
-      if (out != lastSent[idx]) {
-        dmx.setChannel(i, out);
-        lastSent[idx] = out;
-      }
-    }
-  }
-
-  dmx.loop();
+  sender.loop();  // the ESP-NOW send side
 }
