@@ -2,94 +2,113 @@
  * DMX receiver -> forwards the full 512-channel universe out via
  * ESP-NOW using the ESPNowDMX_Sender library.
  *
- * Target board: ESP32-C3 Super Mini (single-core RISC-V). DMX reading
- * runs in its own dedicated FreeRTOS task rather than being polled
- * inline from loop().
- *
- * The glitch filter (all-zero self-clear / torn short frame
- * detection, see DmxSanityFilter.h for the full writeup) now lives in
- * DmxSanityFilter, a small companion class wrapping dmxRx. It is
- * DISABLED by default -- explicitly enabled below via
- * enableSanityCheck(true), since this project needs it. To turn it
- * off (e.g. to test whether flicker is still filter-related), just
- * comment out that one line. setSuspectHoldFrames() lets you tune how
- * many consecutive suspect updates get held before being trusted as a
- * real event -- 90 (~3s at ~30Hz) is this project's working default,
- * shown explicitly below even though it doesn't need to be, since
- * it's likely to need tuning as the fixture grows.
+ * Target board: ESP32-C3 Super Mini (single-core RISC-V).
  */
 
-#include <Dmx_ESP32.h>
-#include "ESPNowDMX_Sender.h" //https://github.com/andymann/ESPNowDMX
-#include "DmxSanityFilter.h" //https://github.com/andymann/DmxSanityFilter
+/*
+  If you are using a stock FTDI USB-to-Serial adapter, manually 
+  override QLC+'s interface settings to use "Pro RX/TX" mode. This
+  dramatically reduces flickering and DMX dropouts.
 
-#define DMX_RX_PIN 20   // FTDI TTL DMX line -> GPIO20 (matches this
-                        // project's original C3 wiring)
-#define DMX_TASK_PRIORITY 3 // kept below Dmx_ESP32's internal readTask
-                             // priority (4) as defense in depth.
+  If you want QLC+ to automatically detect the sender as an 
+  Enttec DMX USB Pro device you need to overwrite the FTDI's EEPROM.
+  More info on that can be found here:
+  https://waterpigs.co.uk/articles/ftdi-configure-mac-linux/
+*/
+
+#include <HardwareSerial.h>
+#include "ESPNowDMX_Sender.h" //https://github.com/andymann/ESPNowDMX
+
+#define DMX_RX_PIN 20  // FTDI TX -> here
+#define DMX_TX_PIN 4   // FTDI RX <- here
+
+#define SOM 0x7E
+#define EOM 0xE7
+#define LABEL_GET_PARAMS 3
+#define LABEL_SEND_DMX 6
 #define NUM_CHANNELS 512
 
-// Uncomment to enable a per-frame debug print on every filter.update()
-// call that reports a change, tagged with how it was classified. Only
-// lists channels that just changed -- printing all 512 values every
-// frame would flood the serial port at 115200 baud.
-#define RAW_FRAME_DEBUG
-
-dmxRx dmx(&Serial1, DMX_RX_PIN);
+HardwareSerial ProSerial(1);
 ESPNowDMX_Sender sender;
-DmxSanityFilter filter(dmx, NUM_CHANNELS);
 
-void dmxTask(void *pvParameters) {
-  dmx.configure();
-  dmx.start();
+uint8_t previousDmx[NUM_CHANNELS] = {0};
 
-  filter.enableSanityCheck(true);   // OFF by default -- this project needs it on
-  filter.setSuspectHoldFrames(90);  // this project's working default; tune as needed
+void sendMessage(uint8_t label, const uint8_t* data, uint16_t len) {
+  ProSerial.write(SOM);
+  ProSerial.write(label);
+  ProSerial.write(len & 0xFF);
+  ProSerial.write((len >> 8) & 0xFF);
+  if (len > 0) ProSerial.write(data, len);
+  ProSerial.write(EOM);
+}
 
-  for (;;) {
-    if (filter.update()) {
-      for (uint16_t ch = 1; ch <= NUM_CHANNELS; ch++) {
-        if (filter.channelChanged(ch)) {
-          sender.setChannel(ch, filter.channelValue(ch));
-#ifdef RAW_FRAME_DEBUG
-          Serial.print("ch"); Serial.print(ch);
-          Serial.print("="); Serial.print(filter.channelValue(ch));
-          Serial.print(' ');
-#endif
-        }
+void handleMessage(uint8_t label, uint8_t* data, uint16_t len) {
+  if (label == LABEL_GET_PARAMS) {
+    uint8_t reply[5] = { 1, 0, 9, 1, 40 };
+    sendMessage(LABEL_GET_PARAMS, reply, sizeof(reply));
+  }
+  else if (label == LABEL_SEND_DMX) {
+    // data[0] is the DMX start code (0x00), channels follow from data[1]
+    uint16_t channelCount = (len > 0) ? (len - 1) : 0;
+    if (channelCount > NUM_CHANNELS) channelCount = NUM_CHANNELS;
+
+    for (uint16_t i = 0; i < channelCount; i++) {
+      uint8_t value = data[1 + i];
+      uint16_t ch = i + 1; // sender.setChannel is 1-indexed
+      if (value != previousDmx[i]) {
+        sender.setChannel(ch, value);
+        previousDmx[i] = value;
       }
-#ifdef RAW_FRAME_DEBUG
-      const char *statusStr;
-      switch (filter.lastStatus()) {
-        case DmxFrameStatus::Forwarded: statusStr = "FWD";      break;
-        case DmxFrameStatus::Accepted:  statusStr = "ACCEPTED"; break;
-        case DmxFrameStatus::Held:      statusStr = "HELD";     break;
-        default:                        statusStr = "BYPASSED"; break;
-      }
-      Serial.print("[");
-      Serial.print(statusStr);
-      Serial.print("] @");
-      Serial.println(millis());
-#endif
     }
-    vTaskDelay(1);
   }
 }
 
 void setup() {
-  Serial.begin(115200); // USB serial, separate from Serial1/DMX
-#ifdef RAW_FRAME_DEBUG
-  Serial.println("Raw per-frame debug enabled (full 512-channel universe).");
-#endif
+  Serial.begin(9600); // USB CDC monitor
+  ProSerial.begin(250000, SERIAL_8N2, DMX_RX_PIN, DMX_TX_PIN);
 
   sender.begin();
-
-  uint8_t universe[512] = {0};
+  uint8_t universe[NUM_CHANNELS] = {0};
   sender.setUniverse(universe);
-
-  xTaskCreate(dmxTask, "dmxTask", 4096, NULL, DMX_TASK_PRIORITY, NULL);
 }
 
 void loop() {
-  sender.loop(); // the ESP-NOW send side
+  static uint8_t state = 0;
+  static uint8_t label = 0;
+  static uint16_t dataLen = 0;
+  static uint16_t dataIdx = 0;
+  static uint8_t buf[600];
+
+  while (ProSerial.available()) {
+    uint8_t b = ProSerial.read();
+    switch (state) {
+      case 0: // wait for SOM
+        if (b == SOM) state = 1;
+        break;
+      case 1: // label
+        label = b;
+        state = 2;
+        break;
+      case 2: // length LSB
+        dataLen = b;
+        state = 3;
+        break;
+      case 3: // length MSB
+        dataLen |= (b << 8);
+        dataIdx = 0;
+        state = (dataLen == 0) ? 5 : 4;
+        break;
+      case 4: // payload
+        if (dataIdx < sizeof(buf)) buf[dataIdx] = b;
+        dataIdx++;
+        if (dataIdx >= dataLen) state = 5;
+        break;
+      case 5: // expect EOM
+        if (b == EOM) handleMessage(label, buf, dataLen);
+        state = 0;
+        break;
+    }
+  }
+
+  sender.loop(); // ESP-NOW send side
 }
