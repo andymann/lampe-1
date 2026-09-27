@@ -14,7 +14,7 @@
 // RX isn't needed for DMX TX-only operation but the pin is still reserved.
 
 const int dmxTransmitPin = 21;  // TX0 -> RS485 DI
-const int dmxEnablePin   = 4;   // DE/RE tied together on most RS485 modules — pick any free GPIO (avoid 8/9 strapping pins)
+const int dmxEnablePin   = 4;   // DE/RE tied together on most RS485 modules -- pick any free GPIO (avoid 8/9 strapping pins)
 
 dmxTx dmxOut(&Serial0, dmxTransmitPin, dmxEnablePin);
 
@@ -30,30 +30,17 @@ portMUX_TYPE dmxMux = portMUX_INITIALIZER_UNLOCKED;
 ESPNowDMX_Receiver receiver;
 
 void dmxCallback(uint8_t universe, const uint8_t* data) {
-  const uint8_t expected = 149;   // whatever QLC+ channel 2 is set to
-  static int consecutiveBad = 0;
-
-  uint8_t v = data[1];
-
-  if (v != expected) {
-    consecutiveBad++;
-  } else {
-    if (consecutiveBad > 0) {
-      Serial.printf("[%lu] recovered after %d bad callback(s)\n", millis(), consecutiveBad);
-    }
-    consecutiveBad = 0;
-  }
-
   portENTER_CRITICAL(&dmxMux);
   memcpy(dmxData, data, NUM_DMX_CHANNELS);
   portEXIT_CRITICAL(&dmxMux);
 }
+
 void onEspNowReceive(const uint8_t *mac, const uint8_t *data, int len) {
   receiver.handleReceive(mac, data, len);
 }
 
 void setup() {
-  Serial.begin(115200);   // USB-CDC, for debug only — NOT the DMX UART
+  Serial.begin(115200);   // USB-CDC, for debug only -- NOT the DMX UART
 
   // --- Dmx_ESP32 setup (uses Serial0 / UART0 internally now) ---
   dmxOut.configure();
@@ -61,9 +48,16 @@ void setup() {
   // --- ESP-NOW DMX receiver setup ---
   receiver.begin();  // true by default = internal ESP-NOW init
   receiver.setDMXReceiveCallback(dmxCallback);
+
+  // Re-broadcast every received packet so downstream receivers extend range.
+  receiver.enableRelay(true);
 }
 
 void loop() {
+  // Drain relay buffer: sends the deferred esp_now_send() outside the
+  // receive callback. Call this as often as possible for low relay latency.
+  receiver.relayLoop();
+
   // Take a quick local snapshot under the lock, then release the lock
   // BEFORE calling into dmxOut.writeBytes()/transmit().
   static uint8_t localData[NUM_DMX_CHANNELS];
